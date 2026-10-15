@@ -1,0 +1,140 @@
+name: Build Bonobo Git Server
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    env:
+      SOLUTION: Bonobo.Git.Server.sln
+      WEB_PROJECT: Bonobo.Git.Server\Bonobo.Git.Server.csproj
+      PUBLISH_DIR: ${{ github.workspace }}\publish\Bonobo.Git.Server
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+        with:
+          nuget-version: "6.x"
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+
+      - name: Install .NET Framework 4.6 Developer Pack
+        shell: powershell
+        run: |
+          choco install netfx-4.6-devpack -y --no-progress
+
+          $referenceAssemblies = "${env:ProgramFiles(x86)}\Reference Assemblies\Microsoft\Framework\.NETFramework\v4.6"
+
+          if (-not (Test-Path $referenceAssemblies)) {
+              throw ".NET Framework 4.6 reference assemblies were not installed: $referenceAssemblies"
+          }
+
+          Write-Host ".NET Framework 4.6 reference assemblies found:"
+          Get-ChildItem $referenceAssemblies | Select-Object -First 10
+
+      - name: Restore NuGet packages
+        shell: powershell
+        run: |
+          nuget restore "$env:SOLUTION" -NonInteractive
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "NuGet restore failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Prepare publish directory
+        shell: powershell
+        run: |
+          if (Test-Path "$env:PUBLISH_DIR") {
+              Remove-Item "$env:PUBLISH_DIR" -Recurse -Force
+          }
+
+          New-Item -ItemType Directory -Path "$env:PUBLISH_DIR" -Force | Out-Null
+
+      - name: Build and publish web project
+        shell: powershell
+        run: |
+          msbuild "$env:WEB_PROJECT" `
+            /m `
+            /t:Rebuild `
+            /p:Configuration=Release `
+            /p:Platform="AnyCPU" `
+            /p:DeployOnBuild=true `
+            /p:WebPublishMethod=FileSystem `
+            /p:DeleteExistingFiles=true `
+            /p:publishUrl="$env:PUBLISH_DIR" `
+            /p:DebugSymbols=false `
+            /p:DebugType=None `
+            /nr:false `
+            /v:minimal
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "MSBuild failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Validate published application
+        shell: powershell
+        run: |
+          if (-not (Test-Path "$env:PUBLISH_DIR\web.config")) {
+              throw "Published web.config was not found."
+          }
+
+          if (-not (Test-Path "$env:PUBLISH_DIR\bin")) {
+              throw "Published bin directory was not found."
+          }
+
+          $dllCount = (
+              Get-ChildItem "$env:PUBLISH_DIR\bin" `
+                -Filter "*.dll" `
+                -File `
+                -ErrorAction Stop
+          ).Count
+
+          if ($dllCount -eq 0) {
+              throw "No assemblies were produced in the published bin directory."
+          }
+
+          Write-Host "Published DLL count: $dllCount"
+
+      - name: Create deployment ZIP
+        shell: powershell
+        run: |
+          $zipPath = "${{ github.workspace }}\Bonobo.Git.Server-${{ github.sha }}.zip"
+
+          if (Test-Path $zipPath) {
+              Remove-Item $zipPath -Force
+          }
+
+          Compress-Archive `
+            -Path "$env:PUBLISH_DIR\*" `
+            -DestinationPath $zipPath `
+            -CompressionLevel Optimal
+
+          if (-not (Test-Path $zipPath)) {
+              throw "Deployment ZIP was not created."
+          }
+
+          Get-FileHash $zipPath -Algorithm SHA256 |
+              Format-List Algorithm, Hash, Path
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bonobo-Git-Server-Release
+          path: Bonobo.Git.Server-${{ github.sha }}.zip
+          if-no-files-found: error
+          retention-days: 7
