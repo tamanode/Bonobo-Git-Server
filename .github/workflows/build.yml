@@ -1,0 +1,43 @@
+name: Build Bonobo Git Server
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore NuGet packages
+        run: nuget restore Bonobo.Git.Server.sln
+
+      - name: Build
+        run: msbuild Bonobo.Git.Server.sln /m /p:Configuration=Release /p:Platform="Any CPU"
+
+      - name: Show build output
+        shell: powershell
+        run: |
+          Write-Host "=== Build output ==="
+          Get-ChildItem -Path . -Directory -Recurse |
+            Where-Object { $_.Name -eq "bin" } |
+            ForEach-Object {
+              Write-Host $_.FullName
+              Get-ChildItem $_.FullName -Recurse
+            }
+
+      - name: Upload Bonobo artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bonobo-Git-Server-Release
+          path: |
+            Bonobo.Git.Server/bin/
+          if-no-files-found: error
