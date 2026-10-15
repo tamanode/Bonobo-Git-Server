@@ -1,1 +1,271 @@
+name: Build Bonobo Git Server
 
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bonobo-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Bonobo for IIS
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    env:
+      WEB_PROJECT: Bonobo.Git.Server\Bonobo.Git.Server.csproj
+      PUBLISH_DIR: ${{ github.workspace }}\artifacts\Bonobo.Git.Server
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Verify runner and project
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Operating system:"
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object Caption, Version, OSArchitecture
+
+          if (-not $IsWindows) {
+              throw "This workflow must run on Windows."
+          }
+
+          if (-not (Test-Path $env:WEB_PROJECT)) {
+              throw "Web project not found: $env:WEB_PROJECT"
+          }
+
+          Write-Host "Web project found: $env:WEB_PROJECT"
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+        with:
+          nuget-version: "6.x"
+
+      - name: Setup Visual Studio MSBuild
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: "[17.0,18.0)"
+          msbuild-architecture: x64
+
+      - name: Install .NET Framework 4.6 Developer Pack
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $frameworkPath = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            "Reference Assemblies\Microsoft\Framework\.NETFramework\v4.6"
+
+          if (-not (Test-Path $frameworkPath)) {
+              Write-Host ".NET Framework 4.6 targeting pack is not installed."
+              Write-Host "Installing netfx-4.6-devpack..."
+
+              choco install netfx-4.6-devpack `
+                --yes `
+                --no-progress `
+                --limit-output
+
+              $chocoExitCode = $LASTEXITCODE
+
+              if ($chocoExitCode -notin @(0, 1641, 3010)) {
+                  throw "Developer Pack installation failed with exit code $chocoExitCode."
+              }
+          }
+          else {
+              Write-Host ".NET Framework 4.6 targeting pack already exists."
+          }
+
+          if (-not (Test-Path $frameworkPath)) {
+              throw "Reference assemblies were not found after installation: $frameworkPath"
+          }
+
+          $frameworkAssembly = Join-Path $frameworkPath "mscorlib.dll"
+
+          if (-not (Test-Path $frameworkAssembly)) {
+              throw "Required reference assembly was not found: $frameworkAssembly"
+          }
+
+          Write-Host ".NET Framework 4.6 reference assemblies verified:"
+          Write-Host $frameworkPath
+
+      - name: Display build tool versions
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "MSBuild:"
+          msbuild -version
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "MSBuild is unavailable."
+          }
+
+          Write-Host "NuGet:"
+          nuget help | Select-Object -First 1
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "NuGet is unavailable."
+          }
+
+      - name: Restore NuGet packages
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          nuget restore "Bonobo.Git.Server.sln" `
+            -NonInteractive `
+            -Verbosity normal
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "NuGet restore failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Prepare publish directory
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $artifactRoot = Split-Path $env:PUBLISH_DIR -Parent
+
+          if (Test-Path $artifactRoot) {
+              Remove-Item $artifactRoot -Recurse -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path $env:PUBLISH_DIR `
+            -Force |
+            Out-Null
+
+          Write-Host "Publish directory prepared:"
+          Write-Host $env:PUBLISH_DIR
+
+      - name: Build and publish web project
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          msbuild $env:WEB_PROJECT `
+            /m `
+            /t:Rebuild `
+            /p:Configuration=Release `
+            /p:Platform=AnyCPU `
+            /p:DeployOnBuild=true `
+            /p:WebPublishMethod=FileSystem `
+            /p:DeleteExistingFiles=true `
+            /p:publishUrl="$env:PUBLISH_DIR" `
+            /p:DebugSymbols=false `
+            /p:DebugType=None `
+            /p:AutoParameterizationWebConfigConnectionStrings=false `
+            /p:UseSharedCompilation=false `
+            /nr:false `
+            /v:minimal
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "MSBuild failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Validate published application
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $requiredPaths = @(
+              (Join-Path $env:PUBLISH_DIR "web.config"),
+              (Join-Path $env:PUBLISH_DIR "bin")
+          )
+
+          foreach ($requiredPath in $requiredPaths) {
+              if (-not (Test-Path $requiredPath)) {
+                  throw "Required publish output not found: $requiredPath"
+              }
+          }
+
+          $assemblies = Get-ChildItem `
+            -Path (Join-Path $env:PUBLISH_DIR "bin") `
+            -Filter "*.dll" `
+            -File `
+            -ErrorAction Stop
+
+          if ($assemblies.Count -eq 0) {
+              throw "No DLL files were produced in the published bin directory."
+          }
+
+          $publishedFiles = Get-ChildItem `
+            -Path $env:PUBLISH_DIR `
+            -File `
+            -Recurse `
+            -ErrorAction Stop
+
+          if ($publishedFiles.Count -eq 0) {
+              throw "The publish directory is empty."
+          }
+
+          Write-Host "Publish validation successful."
+          Write-Host "Published files: $($publishedFiles.Count)"
+          Write-Host "Published assemblies: $($assemblies.Count)"
+
+          $publishedFiles |
+            Sort-Object FullName |
+            Select-Object -First 30 FullName, Length
+
+      - name: Create deployment ZIP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $zipPath = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "Bonobo.Git.Server-Release.zip"
+
+          if (Test-Path $zipPath) {
+              Remove-Item $zipPath -Force
+          }
+
+          Compress-Archive `
+            -Path (Join-Path $env:PUBLISH_DIR "*") `
+            -DestinationPath $zipPath `
+            -CompressionLevel Optimal `
+            -Force
+
+          if (-not (Test-Path $zipPath)) {
+              throw "Deployment ZIP was not created: $zipPath"
+          }
+
+          $zipFile = Get-Item $zipPath
+
+          if ($zipFile.Length -eq 0) {
+              throw "Deployment ZIP is empty."
+          }
+
+          $hash = Get-FileHash `
+            -Path $zipPath `
+            -Algorithm SHA256
+
+          Write-Host "Deployment package:"
+          Write-Host $zipFile.FullName
+          Write-Host "Size: $($zipFile.Length) bytes"
+          Write-Host "SHA256: $($hash.Hash)"
+
+      - name: Upload IIS deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bonobo-Git-Server-Release
+          path: Bonobo.Git.Server-Release.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
